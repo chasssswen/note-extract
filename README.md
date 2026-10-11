@@ -27,6 +27,14 @@ python3 ~/.codex/skills/.system/skill-installer/scripts/install-skill-from-githu
 
 ## Python 依赖与命令
 
+### 无 Cookie 是否可以提取
+
+2026-10-11 实测：一篇笔记的**完整分享链接**无 Cookie 成功取得正文和全部4张图片，MD/Word正文及嵌图顺序检查通过；去掉分享参数的同一链接只返回首页壳页。这说明部分笔记可以无 Cookie 提取，不能保证所有链接都可以。
+
+用户明确要求无 Cookie 模式时，可通过 HTTP 工具保存页面，再运行 `extract_note.py --html 页面.html --url 原分享链接 --out 输出目录`。HTML 和 CDN 配图请求均可不携带 Cookie；保留完整分享参数，按目标笔记和图片完整性判断成功。TLS证书错误与登录状态分别处理，不能关闭证书验证。此模式及普通认证流程见 [SKILL.md](skills/note-extract/SKILL.md)。
+
+### 普通认证提取
+
 需要 Python 3.10+。在仓库根目录执行：
 
 ```bash
