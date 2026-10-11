@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Read Chrome XHS cookies, fetch note HTML/CDN over HTTP, export MD and DOCX."""
+"""Extract XHS notes without cookies first; authenticated retry exports MD/DOCX."""
 import argparse
 import hashlib
 import html
@@ -7,8 +7,12 @@ import io
 import json
 import os
 import re
+import shutil
 import sqlite3
+import ssl
+import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -21,9 +25,11 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 SKILL = Path(__file__).resolve().parents[1]
-for dep in (SKILL / '.deps',):
-    if dep.is_dir():
-        sys.path.insert(0, str(dep))
+dep = SKILL / '.deps'
+if not dep.is_dir():
+    dep = SKILL.parents[1] / '.runtime/note-extract-deps'  # Existing project installs.
+if dep.is_dir():
+    sys.path.insert(0, str(dep))
 
 TZ = ZoneInfo('Asia/Shanghai')
 UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36'
@@ -37,8 +43,9 @@ PAGE_HEADERS = {
 
 
 class ExtractError(Exception):
-    def __init__(self, code, message):
+    def __init__(self, code, message, http_status=None):
         self.code = code
+        self.http_status = http_status
         super().__init__(message)
 
 
@@ -75,8 +82,61 @@ class RestrictedRedirect(urllib.request.HTTPRedirectHandler):
         return redirected
 
 
+def anonymous_fetch_curl(url, image=False):
+    """Use the system HTTP client without its config, cookies, or unchecked redirects."""
+    limit = 40 * 1024 * 1024 if image else 12 * 1024 * 1024
+    headers = dict(PAGE_HEADERS)
+    if image:
+        headers['Accept'] = 'image/webp,image/png,image/jpeg,*/*;q=0.8'
+    current = url
+    with tempfile.TemporaryDirectory(prefix='note-extract-http-') as tmp:
+        body, response_headers = Path(tmp) / 'body', Path(tmp) / 'headers'
+        for _ in range(6):
+            parsed = urllib.parse.urlsplit(current)
+            if parsed.scheme != 'https' or parsed.username or parsed.password or parsed.port not in (None, 443) or not any(
+                allowed_host(parsed.hostname or '', h) for h in ('xiaohongshu.com', 'xhslink.com', 'xhscdn.com')
+            ):
+                raise ExtractError('UNEXPECTED_REDIRECT', '请求目标不是预期的HTTPS站点，已停止。')
+            command = ['curl', '-q', '--silent', '--show-error', '--max-time', '35',
+                       '--proto', '=https', '--max-filesize', str(limit), '--header', 'Cookie:',
+                       '--output', str(body), '--dump-header', str(response_headers),
+                       '--write-out', '%{http_code}\n%{content_type}']
+            for name, value in headers.items():
+                command += ['--header', f'{name}: {value}']
+            command.append(current)
+            result = subprocess.run(command, capture_output=True, text=True)
+            if result.returncode == 60:
+                raise ExtractError('TLS_CERTIFICATE_ERROR', 'TLS证书验证失败，请检查本机CA配置；这不是登录失败。')
+            if result.returncode == 63:
+                raise ExtractError('RESPONSE_TOO_LARGE', '响应超过文件大小上限。')
+            if result.returncode:
+                raise ExtractError('NETWORK_ERROR', '网络请求失败或超时。')
+            status_line, _, content_type = result.stdout.partition('\n')
+            status = int(status_line)
+            if status in (301, 302, 303, 307, 308):
+                locations = re.findall(r'^location:\s*(.+)$', response_headers.read_text(errors='replace'), re.I | re.M)
+                if not locations:
+                    raise ExtractError('UNEXPECTED_REDIRECT', '重定向缺少目标地址，已停止。')
+                current = urllib.parse.urljoin(current, locations[-1].strip())
+                continue  # Next target is checked before another request is sent.
+            if status >= 400:
+                raise ExtractError('HTTP_ERROR', f'HTTP {status}，请检查笔记可访问性或刷新分享链接。', http_status=status)
+            if body.stat().st_size > limit:
+                raise ExtractError('RESPONSE_TOO_LARGE', '响应超过文件大小上限。')
+            return body.read_bytes(), current, status, content_type.strip()
+    raise ExtractError('UNEXPECTED_REDIRECT', '重定向次数超过上限，已停止。')
+
+
 def fetch(url, jar=None, image=False):
-    handlers = [RestrictedRedirect()]
+    if jar is None and shutil.which('curl'):
+        return anonymous_fetch_curl(url, image)
+    context = ssl.create_default_context()
+    try:
+        import certifi
+        context.load_verify_locations(cafile=certifi.where())
+    except ImportError:
+        pass  # System trust remains enabled when optional CA roots are unavailable.
+    handlers = [RestrictedRedirect(), urllib.request.HTTPSHandler(context=context)]
     if jar is not None:
         handlers.append(urllib.request.HTTPCookieProcessor(jar))
     headers = dict(PAGE_HEADERS)
@@ -90,8 +150,12 @@ def fetch(url, jar=None, image=False):
                 raise ExtractError('RESPONSE_TOO_LARGE', '响应超过文件大小上限。')
             return data, response.url, response.status, response.headers.get('Content-Type', '')
     except urllib.error.HTTPError as error:
-        raise ExtractError('HTTP_ERROR', f'HTTP {error.code}，请检查登录、笔记可访问性或刷新分享链接。') from None
-    except (urllib.error.URLError, TimeoutError):
+        raise ExtractError('HTTP_ERROR', f'HTTP {error.code}，请检查笔记可访问性或刷新分享链接。', http_status=error.code) from None
+    except urllib.error.URLError as error:
+        if isinstance(error.reason, ssl.SSLCertVerificationError):
+            raise ExtractError('TLS_CERTIFICATE_ERROR', 'TLS证书验证失败，请检查本机CA配置或安装certifi；这不是登录失败。') from None
+        raise ExtractError('NETWORK_ERROR', '网络请求失败或超时。') from None
+    except TimeoutError:
         raise ExtractError('NETWORK_ERROR', '网络请求失败或超时。') from None
 
 
@@ -432,52 +496,100 @@ def export_note(note, root):
         raise
 
 
+def authentication(args):
+    # Only called in the explicit retry/check stage, after browser login was checked.
+    if args.cookie_stdin:
+        jar = supplied_cookie_jar(sys.stdin.read())
+        return jar, {'source': 'user-supplied-cookie', 'cookie_count': len(jar)}
+    return browser_cookie_jar(args.browser, args.profile)
+
+
+def request_note(url, jar=None):
+    data, final, status, _ = fetch(url, jar)
+    resolved = clean_url(final)
+    try:
+        note_id(url)
+        target_url = url  # Keep the requested ID even if the response is a home/login shell.
+    except ExtractError:
+        try:
+            note_id(resolved)
+            target_url = resolved
+        except ExtractError:
+            raise ExtractError('NOTE_NOT_FOUND', '分享链接未返回可识别的目标笔记，请保留完整分享参数。') from None
+    note = parse_page(data.decode('utf-8'), target_url)
+    note['page_http_status'] = status
+    return note
+
+
+def needs_authentication(error):
+    return error.code in ('NOTE_NOT_FOUND', 'INCOMPLETE_NOTE') or (
+        error.code == 'HTTP_ERROR' and error.http_status in (401, 403)
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--url', action='append', default=[])
     parser.add_argument('--out', type=Path, default=Path('output/笔记提取'))
     parser.add_argument('--browser', choices=['chrome', 'edge', 'firefox', 'brave'], default='chrome')
     parser.add_argument('--profile')
-    parser.add_argument('--cookie-stdin', action='store_true')
+    parser.add_argument('--authenticated', action='store_true', help='匿名失败且已检查浏览器登录后，进行Cookie认证重试')
+    parser.add_argument('--cookie-stdin', action='store_true', help='认证重试或认证检查时，从stdin读取本次Cookie')
     parser.add_argument('--check-auth', action='store_true')
     parser.add_argument('--html', type=Path, help='离线复验，不证明 HTTP 抓取成功')
     args = parser.parse_args()
     if not args.url and not args.check_auth:
         parser.error('至少提供一个 --url')
-    if args.html and (len(args.url) != 1 or args.check_auth):
-        parser.error('--html 必须和一个 --url 一起使用')
-    jar, auth = None, {'source': 'offline-html'}
-    if not args.html:
+    if args.html and (len(args.url) != 1 or args.check_auth or args.authenticated or args.cookie_stdin):
+        parser.error('--html 必须和一个 --url 一起使用，不能同时使用认证参数')
+    if args.cookie_stdin and not (args.authenticated or args.check_auth):
+        parser.error('--cookie-stdin 仅用于 --authenticated 重试或 --check-auth 检查')
+    if args.check_auth:
         try:
-            jar, auth = browser_cookie_jar(args.browser, args.profile)
+            jar, auth = authentication(args)
         except ExtractError as error:
             emit(status='auth_unavailable', code=error.code, message=str(error))
-            if not args.cookie_stdin:
-                return 2
-        if args.cookie_stdin:
-            jar = supplied_cookie_jar(sys.stdin.read())
-            auth = {'source': 'user-supplied-cookie', 'cookie_count': len(jar)}
+            return 2
         emit(status='auth_ready', **auth)
-        if args.check_auth:
-            return 0
-    failed = 0
-    for raw in args.url:
+        return 0
+    cached_auth = None
+    cached_auth_error = None
+    failed = auth_required = 0
+    for input_index, raw in enumerate(args.url, 1):
         started = time.monotonic()
         try:
             url = clean_url(raw)
+            jar, auth = None, {'source': 'anonymous', 'cookie_count': 0}
             if args.html:
-                page, status = args.html.read_text(encoding='utf-8'), None
+                note = parse_page(args.html.read_text(encoding='utf-8'), url)
+                note.update(page_http_status=None, extraction_method='offline-' + note['extraction_method'])
+                auth = {'source': 'offline-html', 'cookie_count': 0}
             else:
-                data, final, status, _ = fetch(url, jar)
-                # Short-link redirects are resolved by the cookie-aware opener;
-                # the jar's domain filter keeps credentials off xhslink/CDN.
-                url = clean_url(final)
-                page = data.decode('utf-8')
-            note = parse_page(page, url)
+                if args.authenticated:
+                    if cached_auth is None and cached_auth_error is None:
+                        try:
+                            cached_auth = authentication(args)
+                            emit(status='auth_ready', **cached_auth[1])
+                        except ExtractError as error:
+                            cached_auth_error = error
+                    if cached_auth_error is not None:
+                        failed += 1
+                        auth_required += 1
+                        emit(status='auth_unavailable', input_index=input_index,
+                             code=cached_auth_error.code, message=str(cached_auth_error))
+                        continue
+                    jar, auth = cached_auth
+                try:
+                    note = request_note(url, jar)
+                except ExtractError as error:
+                    if not args.authenticated and needs_authentication(error):
+                        failed += 1
+                        auth_required += 1
+                        emit(status='auth_required', input_index=input_index, code='AUTH_FALLBACK_REQUIRED', cause=error.code,
+                             message='无Cookie请求未取得完整目标笔记。请在用户自己的浏览器检查登录，已登录后用--authenticated重试。')
+                        continue
+                    raise
             note['authentication'] = auth
-            note['page_http_status'] = status
-            if args.html:
-                note['extraction_method'] = 'offline-' + note['extraction_method']
             # Refresh only expired CDN failures, once, while retaining target ID.
             try:
                 directory = export_note(note, args.out.resolve())
@@ -485,18 +597,17 @@ def main():
                 if error.code != 'HTTP_ERROR' or args.html:
                     raise
                 emit(status='refresh_image_urls', note_id=note['note_id'])
-                data, final, status, _ = fetch(url, jar)
-                note = parse_page(data.decode('utf-8'), final)
-                note.update(authentication=auth, page_http_status=status)
+                note = request_note(url, jar)
+                note['authentication'] = auth
                 directory = export_note(note, args.out.resolve())
-            emit(status='exported', title=note['title'], note_id=note['note_id'], images=len(note['images']), directory=str(directory), seconds=round(time.monotonic() - started, 2))
+            emit(status='exported', input_index=input_index, title=note['title'], note_id=note['note_id'], images=len(note['images']), directory=str(directory), seconds=round(time.monotonic() - started, 2))
         except ExtractError as error:
             failed += 1
-            emit(status='failed', code=error.code, message=str(error))
+            emit(status='failed', input_index=input_index, code=error.code, message=str(error))
         except Exception as error:
             failed += 1
-            emit(status='failed', code='UNEXPECTED_ERROR', error_type=type(error).__name__, message='导出失败，请检查依赖与输出目录；未记录请求 Cookie。')
-    return 1 if failed else 0
+            emit(status='failed', input_index=input_index, code='UNEXPECTED_ERROR', error_type=type(error).__name__, message='导出失败，请检查依赖与输出目录；未记录请求 Cookie。')
+    return 2 if auth_required else 1 if failed else 0
 
 
 if __name__ == '__main__':

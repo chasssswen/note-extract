@@ -1,25 +1,37 @@
 # 协议与维护
 
-## 无 Cookie 验证
+## 默认匿名优先，认证按阶段回退
 
-2026-10-11 使用 curl 进行无 Cookie 请求，忽略个人 curl 配置、显式清空 Cookie 请求头并保持 TLS 证书验证。完整分享链接成功返回目标笔记，正文771字、配图4张，全部配图无 Cookie 下载成功，MD引用与Word嵌图顺序校验通过。去掉分享参数的同一笔记链接返回 HTTP 200 首页壳页，没有目标正文。未在此次协议验证中执行 Word 逐页视觉检查。
+默认命令只对完整分享链接做无Cookie GET，解析目标笔记并下载全部配图。不读取浏览器Cookie，不先要求用户登录。
 
-这是单篇验证结果。是否可匿名提取取决于当次完整链接和站点响应，不将“全部笔记不用Cookie”作为普遍结论。当前普通认证模式仍使用用户自己的浏览器检查登录并读取同一配置的Cookie；用户明确选择无Cookie模式时按入口相应分支执行。
+无目标正文、内容不完整、HTTP 401/403时，脚本输出 `auth_required`、原因及 `AUTH_FALLBACK_REQUIRED`，退出码2。Agent随后打开用户自己的浏览器，检查实际登录状态，已登录后使用 `--authenticated` 对失败项重试。认证重试不重复匿名请求；浏览器登录检查由Agent完成，脚本不能证明页面已登录。
 
-Python 默认请求若因本机 CA 配置产生 `CERTIFICATE_VERIFY_FAILED`，先区分证书配置与网站登录限制。可使用正常验证TLS的其他HTTP工具完成验证，不禁用证书验证。
+`--authenticated`才读取指定浏览器/配置Cookie；`--cookie-stdin`使用当前输入，不额外探测本地浏览器。`--check-auth`是独立认证诊断模式，不在默认路径执行。认证读取只针对xiaohongshu.com，不使用读取全部浏览器的load()。
 
-## 普通认证模式
+系统拒绝读取、数据库占用或解密失败与页面登录状态分别判断。保留已完成结果，不改变系统权限、不关闭浏览器、不绕过系统拒绝。Cookie只在内存中使用，不保存、不打印。新输入优先于旧Cookie。
 
-入口顺序是用户自己的 Chrome 打开笔记 → 检查该页面登录态 → 已登录后读取同一配置的 Cookie → HTTP 提取。浏览器步骤由当前浏览器工具完成，`extract_note.py` 不负责打开页面；`--check-auth` 只验证 Cookie 读取结果。Codex 内置浏览器、临时配置与用户 Chrome 是不同会话，不能互相代替登录证据。
+## 请求与解析
 
-页面请求是用户完整笔记 URL 的 GET；不存在必须额外调用的签名接口。保留 xsec_token，不伪造或计算隐藏签名。短链用无 Cookie 的 HTTPS GET 跟随站内重定向，得到笔记地址后再带 Cookie。
+保留xsec_token等原始分享参数，不伪造或计算隐藏签名。短链在匿名阶段无Cookie跟随站内HTTPS重定向。认证CookieJar按域名和路径发送，重定向不转发手工Cookie标头；CDN配图始终不带Cookie。
 
-可通过已连接浏览器公开支持的 Cookie/请求头接口读取当前站点 Cookie，或采用 [browser-cookie3 官方实现](https://github.com/borisbabic/browser_cookie3) 读取已经检查过的同一 Chrome 配置。后者只调用指定浏览器与小红书域名过滤，不调用读取所有浏览器的 load()。其跨系统解密能力受浏览器版本和系统权限限制；出现 Permission denied / Operation not permitted，应报告系统拒绝读取，不尝试其他工具绕过。macOS Keychain 如有授权弹窗，留给用户处理。页面已登录但 Cookie 读取失败时保留两项实际结论，不把它写成用户未登录或未授权提取。
+保留用户请求的目标ID，即便最终返回首页/登录壳页也不能误取其他笔记。目标noteDetailMap优先，JSON-LD Article备选。部分状态对象含new Map([])，仅JSON解码目标noteDetailMap，不执行网页JS。发布时间优先note.time；JSON-LD datePublished可能是加载时间。
 
-输出只保留目标笔记，不保存整个 `__INITIAL_STATE__`，避免夹带当前账号、推荐流或评论。CookieJar 正常遵守 Cookie 的域名和路径；重定向不转发手工 Cookie 标头。
+HTTP 200不是成功：目标正文、图片列表、下载解码与MD/Word内容校验都必须成立。视频、不存在的笔记、输出错误等不进入登录回退。图片链接失效可刷新原笔记一次，仍按原ID和同一认证状态核对，不无限重试。
 
-部分已登录页面的其他状态对象含 `new Map([])`，整个 INITIAL_STATE 不能直接 JSON.parse。脚本只对目标 `noteDetailMap` 使用 JSON raw_decode，避免因无关状态语法而退化到丢失换行的 JSON-LD description。
+## TLS与依赖
 
-Word 渲染：本机捆绑 LibreOffice 的默认字体配置可能遗漏系统中文字体，表现为中文空白而英文可见。使用任务 QA 目录内的独立 fontconfig 配置，以 `FONTCONFIG_FILE` 仅传给本次渲染进程；加入实际存在的 `~/Library/Fonts`、`/System/Library/Fonts` 和捆绑 LibreOffice 的字体目录，并将字体缓存放 QA 目录。不要改系统或运行时文件。正文用 Arial Unicode MS，保留系统 Emoji 回退；清除默认 Title 样式的段落边框。仍须逐页看最终 PNG，不能仅靠文本提取宣称排版通过。
+匿名网页及CDN请求优先使用系统curl，`-q`忽略个人配置，显式清空Cookie头，不使用cookie文件；逐跳校验HTTPS和站点白名单，不把Cookie带到重定向。无curl时使用Python HTTPS；认证网页请求使用Python CookieJar。不同HTTP客户端可能返回不同页面，是否成功仍以目标内容校验为准。
 
-历史验证中，无 Cookie 的 HTTP 200 页面可能只是首页壳页；只以目标笔记对象和正文图片的完整性判定成功。页面已登录但系统拒绝读取 Cookie 时，明确分别记录这两个状态。用户提供 Cookie 的成功提取不能当作 Chrome 自动读取已验证成功。
+Python使用系统信任并补充certifi根证书；不关闭TLS验证，不改全局证书配置。TLS_CERTIFICATE_ERROR、NETWORK_ERROR等按网络问题处理，不读取Cookie或要求登录。依赖只装到技能.deps。
+
+## Word与交付
+
+脚本将正文与按顺序转换的PNG内嵌Word，检查数量、顺序和文件完整性。逐页视觉检查使用现有Word渲染工具；没有工具就记录未检查，不能将结构验收等同于视觉验收。
+
+中文字体空白时，在任务QA目录使用独立fontconfig，加入实际存在的系统、用户及渲染器字体目录，并只对本次渲染进程设置FONTCONFIG_FILE。不修改系统或运行时文件。保留Emoji回退，逐页看真实PNG。
+
+## 已有验证与适用范围
+
+2026-10-11：完整分享链接无Cookie取得正文771字符、4张配图；全部配图下载、MD引用与Word嵌图顺序校验通过。同笔记去掉分享参数后返回HTTP 200首页壳页。这个单篇结果不保证所有笔记均可匿名访问。
+
+历史上手工Cookie提取成功不能当作Chrome自动读取成功。回退控制的自动化测试使用模拟认证；只有实际检查浏览器并使用当前账号成功提取，才记录本轮真实认证运行。

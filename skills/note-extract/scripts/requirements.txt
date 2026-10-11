@@ -1,3 +1,4 @@
 browser-cookie3>=0.20.1,<1
 python-docx>=1.1,<2
 Pillow>=10,<13
+certifi>=2024.2.2
