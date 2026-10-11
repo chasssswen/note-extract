@@ -1,0 +1,6 @@
+interface:
+  display_name: "笔记提取"
+  short_description: "从小红书链接提取原文和全部配图，整理为 Markdown 与 Word 文档"
+  default_prompt: "使用 $note-extract 提取我提供的小红书笔记链接，先用我自己的 Chrome 打开链接并检查登录态，已登录后提取同一配置的小红书 Cookie，再用协议请求整理原文与全部图片，输出 MD 和 Word。"
+policy:
+  allow_implicit_invocation: true
